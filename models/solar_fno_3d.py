@@ -42,8 +42,9 @@ class FNO3DBlock(eqx.Module):
                  key: jax.random.PRNGKey):
         super().__init__()
         
-        self.modes = modes
-        self.width = width
+        # Store modes as static values (not trainable parameters)
+        # Use static values instead of attributes
+        modes_x, modes_y, modes_z = modes
         
         # Spectral weights (complex)
         spectral_key, local_key = jax.random.split(key)
@@ -72,16 +73,19 @@ class FNO3DBlock(eqx.Module):
         Returns:
             Output tensor of same shape
         """
+        # Get modes from the spectral weights shape
+        modes_x, modes_y, modes_z = self.spectral_weights.shape[:3]
+        
         # Spectral convolution
         x_ft = jnp.fft.rfftn(x, axes=(1, 2, 3))  # Real FFT for efficiency
         
         # Apply spectral weights (truncate to modes)
-        x_ft_truncated = x_ft[:, :self.modes[0], :self.modes[1], :self.modes[2], :]
+        x_ft_truncated = x_ft[:, :modes_x, :modes_y, :modes_z, :]
         x_ft_weighted = x_ft_truncated * self.spectral_weights[None, :, :, :, :]
         
         # Pad back to original size
         x_ft_padded = jnp.zeros_like(x_ft)
-        x_ft_padded = x_ft_padded.at[:, :self.modes[0], :self.modes[1], :self.modes[2], :].set(x_ft_weighted)
+        x_ft_padded = x_ft_padded.at[:, :modes_x, :modes_y, :modes_z, :].set(x_ft_weighted)
         
         # Inverse FFT
         x_spectral = jnp.fft.irfftn(x_ft_padded, axes=(1, 2, 3), s=x.shape[1:4])

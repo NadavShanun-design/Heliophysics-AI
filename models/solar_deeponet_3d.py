@@ -72,49 +72,101 @@ class SolarDeepONet(eqx.Module):
         )
         
         # Trunk network: MLP for 3D coordinates
-        self.trunk_mlp = eqx.nn.MLP(
-            in_size=3,  # x, y, z coordinates
-            out_size=latent_dim,
-            width_size=width,
-            depth=trunk_depth,
-            key=trunk_key
-        )
+        # Create custom MLP to handle input format properly
+        self.trunk_mlp = self._create_trunk_mlp(3, latent_dim, width, trunk_depth, trunk_key)
         
         # Output projection: 3D magnetic field components
-        self.output_proj = eqx.nn.MLP(
-            in_size=latent_dim,
-            out_size=3,  # Bx, By, Bz
-            width_size=width//2,
-            depth=2,
-            key=output_key
-        )
+        self.output_proj = self._create_trunk_mlp(latent_dim, 3, width//2, 2, output_key)
     
     def _create_cnn_encoder(self, input_channels: int, output_dim: int, key: jax.random.PRNGKey):
         """Create CNN encoder for 2D magnetogram processing."""
+        # Create separate keys for each layer
+        keys = jax.random.split(key, 5)
+        
+        # Custom activation class that ignores key argument
+        class GELU(eqx.Module):
+            def __call__(self, x, **kwargs):
+                return jax.nn.gelu(x)
+        
+        # Custom pooling class that ignores key argument
+        class GlobalAvgPool(eqx.Module):
+            def __call__(self, x, **kwargs):
+                return jnp.mean(x, axis=(1, 2))  # Pool over spatial dimensions
+        
+        # Custom LayerNorm that adapts to input size
+        class AdaptiveLayerNorm(eqx.Module):
+            def __call__(self, x, **kwargs):
+                # Compute mean and variance over the last 3 dimensions
+                mean = jnp.mean(x, axis=(-3, -2, -1), keepdims=True)
+                var = jnp.var(x, axis=(-3, -2, -1), keepdims=True)
+                return (x - mean) / jnp.sqrt(var + 1e-6)
+        
         return eqx.nn.Sequential([
             # Initial convolution
-            eqx.nn.Conv2d(input_channels, 64, kernel_size=3, padding=1, key=key),
-            eqx.nn.LayerNorm([64, 256, 256]),
-            jax.nn.gelu,
+            eqx.nn.Conv2d(input_channels, 64, kernel_size=3, padding=1, key=keys[0]),
+            AdaptiveLayerNorm(),
+            GELU(),
             
             # Downsampling blocks
-            eqx.nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1, key=key),
-            eqx.nn.LayerNorm([128, 128, 128]),
-            jax.nn.gelu,
+            eqx.nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1, key=keys[1]),
+            AdaptiveLayerNorm(),
+            GELU(),
             
-            eqx.nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1, key=key),
-            eqx.nn.LayerNorm([256, 64, 64]),
-            jax.nn.gelu,
+            eqx.nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1, key=keys[2]),
+            AdaptiveLayerNorm(),
+            GELU(),
             
-            eqx.nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1, key=key),
-            eqx.nn.LayerNorm([512, 32, 32]),
-            jax.nn.gelu,
+            eqx.nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1, key=keys[3]),
+            AdaptiveLayerNorm(),
+            GELU(),
             
             # Global average pooling + projection
-            lambda x: jnp.mean(x, axis=(2, 3)),  # Global average pooling
-            eqx.nn.Linear(512, output_dim, key=key),
-            jax.nn.gelu
+            GlobalAvgPool(),
+            eqx.nn.Linear(512, output_dim, key=keys[4]),
+            GELU()
         ])
+    
+    def _create_trunk_mlp(self, in_size: int, out_size: int, width: int, depth: int, key: jax.random.PRNGKey):
+        """Create custom MLP that handles input format properly."""
+        keys = jax.random.split(key, depth + 1)
+        
+        # Custom Linear layer that handles bias properly
+        class CustomLinear(eqx.Module):
+            weight: jnp.ndarray
+            bias: jnp.ndarray
+            
+            def __init__(self, in_features: int, out_features: int, key: jax.random.PRNGKey):
+                super().__init__()
+                self.weight = jax.random.normal(key, (out_features, in_features)) * 0.02
+                self.bias = jnp.zeros((out_features,))
+            
+            def __call__(self, x, **kwargs):
+                # x shape: (in_features, batch_size)
+                # weight shape: (out_features, in_features)
+                # bias shape: (out_features,)
+                # output shape: (out_features, batch_size)
+                return self.weight @ x + self.bias[:, None]
+        
+        # Custom activation
+        class GELU(eqx.Module):
+            def __call__(self, x, **kwargs):
+                return jax.nn.gelu(x)
+        
+        layers = []
+        current_size = in_size
+        
+        # Hidden layers
+        for i in range(depth - 1):
+            layers.extend([
+                CustomLinear(current_size, width, key=keys[i]),
+                GELU()
+            ])
+            current_size = width
+        
+        # Output layer
+        layers.append(CustomLinear(current_size, out_size, key=keys[depth]))
+        
+        return eqx.nn.Sequential(layers)
     
     def __call__(self, 
                  magnetogram: jnp.ndarray,  # (3, H, W) - Bx, By, Bz
@@ -137,7 +189,8 @@ class SolarDeepONet(eqx.Module):
         batch_size = coords.shape[0]
         
         # Branch network: encode magnetogram
-        branch_cnn = self.branch_encoder(magnetogram[None, ...])  # Add batch dim
+        # Equinox Conv2d expects (channels, height, width) format
+        branch_cnn = self.branch_encoder(magnetogram)  # No batch dim needed
         
         # Combine with time and metadata
         if time is None:
@@ -153,13 +206,18 @@ class SolarDeepONet(eqx.Module):
         branch_out = jnp.tile(branch_out[None, :], (batch_size, 1))  # (N, latent_dim)
         
         # Trunk network: encode coordinates
-        trunk_out = self.trunk_mlp(coords)  # (N, latent_dim)
+        # Transpose coords to match Equinox Linear layer format
+        coords_t = coords.T  # (3, N)
+        trunk_out = self.trunk_mlp(coords_t)  # (latent_dim, N)
+        trunk_out = trunk_out.T  # (N, latent_dim)
         
         # Combine branch and trunk (element-wise multiplication)
         combined = branch_out * trunk_out  # (N, latent_dim)
         
         # Output projection
-        B_field = self.output_proj(combined)  # (N, 3)
+        combined_t = combined.T  # (latent_dim, N)
+        B_field_t = self.output_proj(combined_t)  # (3, N)
+        B_field = B_field_t.T  # (N, 3)
         
         return B_field
 
